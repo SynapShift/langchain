@@ -5040,7 +5040,10 @@ def _construct_responses_api_input(
                             "apply_patch_call",
                             "apply_patch_call_output",
                         ):
-                            input_.append(_pop_index_and_sub_index(block))
+                            input_item = _pop_index_and_sub_index(block)
+                            if block_type == "function_call":
+                                input_item.pop("annotations", None)
+                            input_.append(input_item)
                         elif block_type == "image_generation_call":
                             # A previous image generation call can be referenced by ID
                             if store is not False:

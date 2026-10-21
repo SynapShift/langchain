@@ -3414,6 +3414,45 @@ def test__construct_responses_api_input_store_false_keeps_full_tool_call_items()
     ]
 
 
+@pytest.mark.parametrize("store", [None, False])
+def test__construct_responses_api_input_function_call_annotations(
+    store: bool | None,
+) -> None:
+    annotation = {
+        "type": "url_citation",
+        "start_index": 0,
+        "end_index": 6,
+        "title": "Source",
+        "url": "https://example.com/",
+    }
+    ai_message = AIMessage(
+        content=[
+            {"type": "text", "text": "Source", "annotations": [annotation]},
+            {
+                "type": "function_call",
+                "name": "show_widget",
+                "arguments": '{"html": "Source"}',
+                "call_id": "call_123",
+                "id": "fc_123",
+                "annotations": [annotation],
+            },
+        ],
+    )
+    original = copy.deepcopy(ai_message)
+
+    result = _construct_responses_api_input([ai_message], store=store)
+
+    assert result[0]["content"][0]["annotations"] == [annotation]
+    assert result[1] == {
+        "type": "function_call",
+        "name": "show_widget",
+        "arguments": '{"html": "Source"}',
+        "call_id": "call_123",
+        "id": "fc_123",
+    }
+    assert ai_message == original
+
+
 def test__construct_responses_api_input_ai_message_with_tool_calls() -> None:
     """Test that AI messages with tool calls are properly converted."""
     tool_calls = [

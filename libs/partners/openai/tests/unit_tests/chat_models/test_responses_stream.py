@@ -6,7 +6,13 @@ from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
-from langchain_core.messages import AIMessageChunk, BaseMessageChunk
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessageChunk,
+    HumanMessage,
+    message_chunk_to_message,
+)
 from langchain_tests.utils.stream_lifecycle import assert_valid_event_stream
 from openai.types.responses import (
     ResponseCompletedEvent,
@@ -22,6 +28,7 @@ from openai.types.responses import (
     ResponseOutputItemAddedEvent,
     ResponseOutputItemDoneEvent,
     ResponseOutputMessage,
+    ResponseOutputTextAnnotationAddedEvent,
     ResponseReasoningItem,
     ResponseReasoningSummaryPartAddedEvent,
     ResponseReasoningSummaryPartDoneEvent,
@@ -34,6 +41,9 @@ from openai.types.responses import (
 from openai.types.responses.response import Response
 from openai.types.responses.response_error import ResponseError
 from openai.types.responses.response_output_text import ResponseOutputText
+from openai.types.responses.response_output_text_annotation_added_event import (
+    AnnotationURLCitation,
+)
 from openai.types.responses.response_reasoning_item import Summary
 from openai.types.responses.response_reasoning_summary_part_added_event import (
     Part as PartAdded,
@@ -812,6 +822,109 @@ def test_responses_stream_encrypted_reasoning_replays_with_store_false(
     # `rs_123` carried no encrypted content and is dropped; `rs_234` is replayed.
     assert [item["id"] for item in reasoning_items] == ["rs_234"]
     assert reasoning_items[0]["encrypted_content"] == "encrypted-content"
+
+
+@pytest.mark.parametrize("output_version", ["responses/v1", "v1"])
+@pytest.mark.parametrize("annotation_before_last_delta", [False, True])
+def test_responses_stream_function_call_annotations_replay(
+    output_version: str, annotation_before_last_delta: bool
+) -> None:
+    arguments = '{"html":"Founded in 1844 \\ue200cite\\ue202turn0search1\\ue201"}'
+    events = [
+        ResponseOutputItemAddedEvent(
+            type="response.output_item.added",
+            sequence_number=0,
+            output_index=0,
+            item=ResponseReasoningItem(type="reasoning", id="rs_123", summary=[]),
+        ),
+        ResponseOutputItemAddedEvent(
+            type="response.output_item.added",
+            sequence_number=1,
+            output_index=1,
+            item=ResponseFunctionToolCallItem(
+                type="function_call",
+                id="fc_123",
+                call_id="call_123",
+                name="show_widget",
+                arguments="",
+                status="in_progress",
+            ),
+        ),
+        ResponseFunctionCallArgumentsDeltaEvent(
+            type="response.function_call_arguments.delta",
+            sequence_number=2,
+            output_index=1,
+            item_id="fc_123",
+            delta=arguments[:-2] if annotation_before_last_delta else arguments,
+        ),
+        ResponseOutputTextAnnotationAddedEvent(
+            type="response.output_text.annotation.added",
+            sequence_number=3,
+            output_index=1,
+            content_index=0,
+            item_id="fc_123",
+            annotation_index=0,
+            annotation=AnnotationURLCitation(
+                type="url_citation",
+                start_index=25,
+                end_index=52,
+                title="Source",
+                url="https://example.com/",
+            ),
+        ),
+    ]
+    if annotation_before_last_delta:
+        events.append(
+            ResponseFunctionCallArgumentsDeltaEvent(
+                type="response.function_call_arguments.delta",
+                sequence_number=4,
+                output_index=1,
+                item_id="fc_123",
+                delta=arguments[-2:],
+            )
+        )
+    events.append(
+        ResponseOutputItemDoneEvent(
+            type="response.output_item.done",
+            sequence_number=len(events),
+            output_index=1,
+            item=ResponseFunctionToolCallItem(
+                type="function_call",
+                id="fc_123",
+                call_id="call_123",
+                name="show_widget",
+                arguments=arguments,
+                status="completed",
+            ),
+        )
+    )
+    llm = ChatOpenAI(model=MODEL, use_responses_api=True, output_version=output_version)
+    mock_client = MagicMock()
+    mock_client.responses.create.return_value = MockSyncContextManager(events)
+
+    full: BaseMessageChunk | None = None
+    with patch.object(llm, "root_client", mock_client):
+        for chunk in llm.stream("test"):
+            full = chunk if full is None else full + chunk
+    assert isinstance(full, AIMessageChunk)
+    assert not full.invalid_tool_calls
+
+    stored = AIMessage.model_validate_json(
+        message_chunk_to_message(full).model_dump_json()
+    )
+    payload = llm._get_request_payload([HumanMessage("test"), stored])
+    function_calls = [
+        item for item in payload["input"] if item.get("type") == "function_call"
+    ]
+    assert function_calls == [
+        {
+            "type": "function_call",
+            "name": "show_widget",
+            "arguments": arguments,
+            "call_id": "call_123",
+            "id": "fc_123",
+        }
+    ]
 
 
 def test_responses_reasoning_done_without_encrypted_content_emits_no_chunk() -> None:
